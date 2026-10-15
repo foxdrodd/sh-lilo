@@ -29,7 +29,7 @@ USRSBIN_DIR=/usr/sbin
 
 SHELL=/bin/sh
 
-CROSS_COMPILE = sh3-linux-
+CROSS_COMPILE = sh4-linux-gnu-
 CC	=$(CROSS_COMPILE)gcc
 LD	=$(CROSS_COMPILE)ld
 OBJCOPY =$(CROSS_COMPILE)objcopy

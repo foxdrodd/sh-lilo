@@ -1,0 +1,6 @@
+*.o
+*.exe
+*.bin
+lilo
+boot.b
+lilo.conf
