@@ -48,3 +48,112 @@ If you mount /dev/hdc at /mnt, the invocation of LILO is:
 
 You need to have /mnt/etc/lilo.conf and /mnt/dev/hdc, /mnt/dev/hda1 and
 other files in the target disk under /mnt.
+
+* Building (2026, Debian/Ubuntu)
+
+	# apt install gcc-sh4-linux-gnu libc6-dev-i386
+	$ make                  # lilo (static, SH-4), boot.b, boot.b-selk
+	$ make lilo32           # static 32-bit x86 installer
+
+Other cross compilers: make CROSS_COMPILE=sh4-unknown-linux-gnu-
+
+  lilo         installer for the SH target itself, static so it runs on
+               any root filesystem (also from a rescue system).
+  lilo32       the same installer for a PC.  It has to be 32-bit: lilo
+               writes C structs with "unsigned long" fields to sector 0,
+               and the first stage reads the second stage sector list at
+               offset 52, which only holds with 4-byte longs.  gcc-multilib
+               is not needed (it conflicts with the sh4 cross compiler), only
+               libc6-dev-i386.
+  boot.b       first.S + second.c: generic second stage, boots the first
+               image ("boot: first-image").
+  boot.b-selk  first.S + second-selk.c: second stage from
+               sh-lilo-selk-20051110 as used on the I-O DATA LANDISK
+               (and rebadged units such as the Plextor PX-EH40L).  It lists
+               the images and waits for a key 1-9 on the serial console
+               ('g' enters the gdb stub); toggling the power switch during
+               the wait picks image 2.  On a USL-5P (detected by the LED
+               register at 0xb0000001 reading back 0x40) the front buttons
+               pick image 2-4 without a menu.
+
+The boot code is built with -fno-toplevel-reorder (start() has to be at the
+start of the second stage, where first.S jumps), -fno-stack-protector and
+-fno-zero-initialized-in-bss; the Makefile checks that start is at
+0x8c201000.
+
+* Installing to a disk image (x86 VM)
+
+lilo needs a real IDE/SCSI disk and refuses loop devices.  Instead of
+writing to the hardware, attach the image to a small x86 QEMU VM as an IDE
+disk, where it is /dev/sda, and run lilo32 there from an initramfs.  Nothing
+runs as root on the host.  Needs qemu-system-x86, a static busybox
+(busybox-static) and an x86 kernel with ata_piix, sd and ext2/ext4 built
+in; Ubuntu's generic kernel works
+
+	$ sudo install -m 644 /boot/vmlinuz-$(uname -r) x86-vmlinuz
+
+The image needs a partition with the root filesystem (sh-lilo itself does
+not care which filesystem, the VM kernel has to mount it).  To start from
+scratch:
+
+	$ truncate -s 2G disk.img
+	$ printf 'label: dos\nstart=2048, type=83, bootable\n' | sfdisk disk.img
+	$ mke2fs -t ext2 -E offset=$((2048*512)) disk.img $(( (2*1024*1024*1024 - 2048*512) / 1024 ))k
+
+Then build the initramfs and run the VM (zImage is the SH kernel):
+
+	$ for d in bin boot dev files mnt proc sys tmp; do mkdir -p initramfs/$d; done
+	$ cp /usr/bin/busybox initramfs/bin/ # x86 busybox to be used in initramfs
+	$ cp lilo32 initramfs/bin/
+	$ cp zImage boot.b-selk initramfs/files/
+	$ cat > initramfs/files/lilo.conf <<'EOT'
+	linear
+	boot=/dev/sda
+	disk=/dev/sda
+		bios=0x80
+	map=/mnt/boot/map
+	install=/mnt/boot/boot.b-selk
+	timeout=50
+	image=/mnt/boot/zImage
+		label=linux
+		append="console=ttySC1,9600 root=/dev/sda1 rw"
+	EOT
+	$ cat > initramfs/init <<'EOT'
+	#!/bin/busybox sh
+	/bin/busybox --install -s /bin
+	mount -t proc proc /proc
+	mount -t sysfs sys /sys
+	mount -t devtmpfs dev /dev
+	for i in $(seq 50); do [ -b /dev/sda1 ] && break; sleep 0.2; done
+	mount /dev/sda1 /mnt && mkdir -p /mnt/boot &&
+	  cp /files/zImage /files/boot.b-selk /mnt/boot/ &&
+	  lilo32 -v -C /files/lilo.conf
+	echo "LILO-EXIT $?"
+	umount /mnt
+	sync
+	poweroff -f
+	EOT
+	$ chmod 755 initramfs/init
+	$ (cd initramfs && find . | cpio -o -H newc -R 0:0 | gzip) > initramfs.cpio.gz
+	$ qemu-system-x86_64 -m 512 -no-reboot -display none -serial stdio \
+	    -kernel x86-vmlinuz -initrd initramfs.cpio.gz \
+	    -append "console=ttyS0 quiet panic=-1" \
+	    -drive file=disk.img,format=raw,if=ide
+
+"LILO-EXIT 0" means the MBR and /boot/map were written.  lilo saves the old
+boot sector to /boot/boot.0800 of the VM, which is gone afterwards; keep a
+copy of the image if you need the old one.  Add -enable-kvm if
+/dev/kvm is usable.  The paths in lilo.conf are the ones in the VM; lilo
+only stores sector numbers, so they do not matter at boot time.  "linear"
+is required (the SH BIOS only does LBA), "bios=0x80" makes the disk the
+first one for the boot code.  For a later kernel update on the running
+system use the static SH lilo with the same file, with /mnt/ removed from
+the paths.
+
+Alternatives:
+  - Run lilo on the target (static lilo, e.g. from a rescue system or
+    NFS root).  This is the normal way after the first install.
+  - Run lilo32 as root on the PC with the disk itself attached (USB-IDE
+    adapter), boot=/dev/sdX, disk=/dev/sdX, bios=0x80, the partition
+    mounted on /mnt.  This writes to the real disk, so take a backup of it
+    first and double-check the device name.
