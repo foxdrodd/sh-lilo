@@ -4,3 +4,5 @@
 lilo
 boot.b
 lilo.conf
+boot.b-selk
+lilo32
