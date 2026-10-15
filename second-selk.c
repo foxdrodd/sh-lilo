@@ -30,6 +30,8 @@ static void reset_tick (void);
 static int get_tick (void);
 static void breakpoint (void);
 static int getch(int);
+static inline int Is_usl5p(void);
+static inline int usl5p_bootsel(unsigned long);
 
 
 static const char hexchars[] = "0123456789abcdef";
