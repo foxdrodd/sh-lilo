@@ -1,0 +1,622 @@
+/* $Id: second.c,v 1.24 2001/01/26 02:01:32 gniibe Exp $
+ *
+ * Secondary boot loader
+ *
+ *  lilo/arch/sh/second.c
+ *
+ *  Copyright (C) 2000  Niibe Yutaka
+ *
+ * This file is subject to the terms and conditions of the GNU General
+ * Public License.
+ *
+ */
+
+#include "defs.h"
+
+static void put_string (unsigned char *);
+static int get_sector_address (unsigned long, int *, unsigned long *);
+static int load_sectors (unsigned long, unsigned long);
+static int read_sectors (int, unsigned long, unsigned char *, int);
+static int load_sectors_with_maps (int, int, unsigned long *);
+
+static int machine_type (void);
+static int serial_type (void);
+static int memory_size (void);
+static int io_base (void);
+static void cache_flush (void);
+static int serial_input (int);
+static void sleep (int);
+static void reset_tick (void);
+static int get_tick (void);
+static void breakpoint (void);
+static int getch(int);
+
+
+static const char hexchars[] = "0123456789abcdef";
+#define digits hexchars		/* 10base is same for 16base (up to 10) */
+static inline char highhex (int x) {  return hexchars[(x >> 4) & 0xf];  }
+static inline char lowhex (int x) {  return hexchars[x & 0xf];  }
+static void printouthex (int);
+
+static void show_imagelist(void);
+
+static unsigned long base_pointer = 0;	/* Avoid BSS */
+static unsigned long kernel_image = 0;	/* Avoid BSS */
+
+/* Sector descriptor */
+#define SD_DESCR1	24
+#define SD_DESCR2	29
+#define SD_DEFCMD	34
+/* 39 prompt (byte) */
+/* 40 length (word) */
+#define SD_MSG		42
+#define SD_KBDTBL	47
+
+#define MAXLOOP		150000
+
+static inline char *string_set (char *dest, const char *str)
+{
+  int len = strlen (str);
+  memcpy (dest, str, len);
+  return dest + len;
+}
+
+void
+start (unsigned long base)
+{
+  unsigned long image_descr;
+  int bootsel;		/* default: first image */
+
+  base_pointer = base;
+
+  put_string ("I");
+  load_sectors (SD_DESCR1, 0x3200);
+  load_sectors (SD_DESCR2, 0x3400);
+  put_string ("L");
+  /* XXX: checksum */
+
+  load_sectors (SD_DEFCMD, 0x3600);
+  load_sectors (SD_KBDTBL, 0x3800);
+  put_string ("O ");
+
+#if 0
+  load_sectors (SD_MSG, 0x3a00);
+#endif
+  /* XXX: delay, key check... */
+  /* XXX: list up images */
+  /* XXX: check signature */
+  /* Input command line */
+  /* XXX: Is there default command line?  Use it! */
+  put_string ("boot: ");
+  put_string ("\n");
+  // put_string ("first-image\n");	/* XXX: should handle input commandline... */
+
+  /* Structure of descriptor
+   [ checksum 2byte ]
+   [ DESCR_SIZE:52-byte
+      (image-name (16-byte)
+       passwd     (16-byte)
+       rd_size    (4-byte)
+       initrd     (5-byte sector desc)
+       start      (5-byte sector desc)
+       start_page (16-bit)
+       flags      (16-bit)
+       vga_mode   (16-bit)
+      )
+   ] * 19
+  */
+
+  if(Is_usl5p()){
+    bootsel = usl5p_bootsel(base_pointer);
+  }else{
+    while (1){
+      int tick, ch;
+      int timeout;
+      char z[2];
+      bootsel = 0;
+
+      timeout = ((*(unsigned short *)(base_pointer+0xe))*55+50)/100;
+      put_string("\n");
+      show_imagelist();
+      
+      put_string("\nSelect boot image -> ");
+      
+      ch = getch((timeout*128)/10);
+      if (ch < 0) break;	/* timeout */
+      z[0] = ch; z[1] = 0;
+      put_string(z);
+      if (ch == 'g'){
+	put_string("\ngoto gdbstub...\n");
+	breakpoint();
+      }
+      if (ch >= '1' && ch <= '9'){
+	bootsel = ch - '1';
+	if (*(char *)(base_pointer + 0x3200+2+ 52*bootsel)) break;
+      }
+    }
+  }
+  put_string("\n");
+
+  image_descr = 0x3200+2 + 52*bootsel;
+
+  put_string ("Loading ");
+  put_string ((char *)(base_pointer+image_descr)); /* Image name */
+
+  kernel_image = base_pointer + 0x10000 - 0x400;
+  {
+    int desc = image_descr+16+16+4+5; /* kernel image */
+
+    /* Skip two sectors: Fallback command line and options */
+    desc = load_sectors_with_maps (desc, 0, &kernel_image);
+    put_string (".");
+
+    while (desc != 0)
+      {
+	desc = load_sectors_with_maps (desc, 0, &kernel_image);
+	put_string (".");
+      }
+  }
+  put_string ("done.\n");
+
+#if 0
+  {
+    int i;
+
+    put_string ("DUMP: ");
+    for (i=0; i<16; i++)
+      printouthex (*(unsigned char *)(base_pointer+0x10000+i));
+    put_string ("\n");
+  }
+#endif
+
+  /* XXX: kernel paramerter setting */
+  {
+    unsigned long parm = base_pointer - 0x200000 + 0x1000;
+    char *cmdline = (char *)(parm+256);
+    int mem_size;
+    unsigned char *p;
+
+    *(long *)parm      = 1;	/* Read only mount? */
+    *(long *)(parm+4)  = 0;	/* RAMDISK Flags */
+    *(long *)(parm+8)  = 0x0301; /* Root device: XXX should get from cls.. */
+    *(long *)(parm+12) = 1;	/* Loader type (LILO = 1) */
+    *(long *)(parm+16) = 0;	/* Initrd start */
+    *(long *)(parm+20) = 0;	/* Initrd size */
+    *(long *)(parm+24) = 0;	/* Not defined yet */
+
+    /* XXX: Should take the line from command line sector... */
+#define DC_MAGIC	0xf4f2	/* magic number of default cmd. line sector */
+    p = (unsigned char *)(base_pointer+0x3600);
+    if(p[0] == (DC_MAGIC & 0xff) && p[1] == (DC_MAGIC >> 8))
+      cmdline = string_set(cmdline, p+2);
+    cmdline = string_set(cmdline, (char *)(base_pointer + 0x10000 - 0x200));
+
+#if 0
+    /* Query to BIOS and build the command line string */
+    /* Build string "mem=XXM" */
+    mem_size = memory_size ();    
+    mem_size >>= 20; /* In Mega-byte */
+    cmdline = string_set (cmdline, "mem=");
+    if (mem_size >= 100)
+      {
+	*cmdline++ = digits[mem_size/100];
+	mem_size = mem_size % 100;
+      }
+    if (mem_size >= 10)
+      {
+	*cmdline++ = digits[mem_size/10];
+	mem_size = mem_size % 10;
+      }
+    *cmdline++ = digits[mem_size];
+    *cmdline++ = 'M';
+    *cmdline++ = ' ';
+
+    switch (machine_type ())
+      {
+      case 0: /* Unknown board */
+	{			/* Build string "sh_mv=unknown,0xXXXXXX,1" */
+	  unsigned int io = io_base ();
+	  int b31_24, b23_16, b15_08, b07_00;
+
+	  b31_24 = (io>>24)&0xff;
+	  b23_16 = (io>>16)&0xff;
+	  b15_08 = (io>>8)&0xff;
+	  b07_00 = (io>>0)&0xff;
+
+	  cmdline = string_set (cmdline, "sh_mv=unknown,0x");
+	  *cmdline++ = highhex (b31_24); *cmdline++ = lowhex (b31_24);
+	  *cmdline++ = highhex (b23_16); *cmdline++ = lowhex (b23_16);
+	  *cmdline++ = highhex (b15_08); *cmdline++ = lowhex (b15_08);
+	  *cmdline++ = highhex (b07_00); *cmdline++ = lowhex (b07_00);
+	  cmdline = string_set (cmdline, ",1 ");
+	  break;
+	}
+
+      case 1:
+	cmdline = string_set (cmdline, "sh_mv=CqREEK ");
+	break;
+
+      case 3:
+	cmdline = string_set (cmdline, "sh_mv=SolutionEngine ");
+	break;
+      case 4:
+	cmdline = string_set (cmdline, "sh_mv=CAT-68701 ");
+        break;
+      }
+
+    if (serial_type () == 0)
+      cmdline = string_set (cmdline, "console=ttySC0,115200");
+    else
+      cmdline = string_set (cmdline, "console=ttySC1,115200");
+#endif
+
+    *cmdline = '\0';		/* Terminate the string */
+  }
+
+  cache_flush ();
+  asm volatile ("jmp @r0; nop"
+		: /* no output */
+		: "z" (base_pointer + 0x10000));
+}
+
+static void show_imagelist(void)
+{
+  int n;
+  char *p;
+  char z[2];
+  z[1] = 0;
+
+  for (n = 0; n < 9; n++){
+    p = ((char *)(base_pointer+0x3200+52*n+2)); /* Image name */
+    if (*p){
+      put_string("  ");
+      z[0] = '1' + n;
+      put_string(z);
+      put_string(" : ");
+      put_string(p);
+      put_string("\n");
+    }
+  }
+  return;
+}
+
+
+// LANDISK and USL-5P button boot selector
+#define LED     *((volatile unsigned char *) 0xb0000001)
+#define BTN     *((volatile unsigned char *) 0xb0000002)
+#define INT_BTN *((volatile unsigned char *) 0xb0000005)
+#define INT_PSW *((volatile unsigned char *) 0xb0000006)
+
+#define LED_PWR    0x01  
+#define BTN_PWR    0x10
+#define BTN_RMV    0x04
+#define BTN_CPY    0x02
+#define BTN_SEL    0x01
+#define BTN_INT    0x80
+
+
+static int getch(int timeout)
+{
+  int tick, ntick, ch;
+  int loop;
+  reset_tick();
+  ntick = 0;
+
+  loop = MAXLOOP;
+  while ((tick = get_tick()) < timeout && loop > 0){
+    if((BTN & 0x10) == 0){          /* power switch off */
+      while((BTN & 0x10) == 0){ ; }
+      INT_PSW = (unsigned char)0;
+      return '2';
+    }
+    ch = serial_input(1);
+    if (ch > 0) return ch;
+    if (ntick < tick){
+      put_string(".");
+      ntick += 64;
+    }
+    loop--;
+  }
+  return -1;	/* timeout */
+}
+
+static int
+load_sectors_with_maps (int desc, int offset, unsigned long *buf_p)
+{
+  int dev;
+  unsigned long lba;
+  int i, count;
+
+  /* Load the map at 0x3000 */
+  if (load_sectors (desc, 0x3000) < 0)
+    return 0;
+
+  for (i = offset*5; i<505; i+=5)
+    {
+      if ((count = get_sector_address (0x3000+i, &dev, &lba)) == 0)
+	return 0;
+
+      read_sectors (dev, lba, (unsigned char *)*buf_p, count);
+      *buf_p += count*512;
+    }
+
+  /* There's next map */
+  return 0x3000+505;
+}
+
+static int
+machine_type (void)
+{
+  register long __sc0 __asm__ ("r0") = 3; /* FEATURE QUERY */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0)
+		: "memory");
+
+  return (__sc0 >> 8);
+}
+
+static int
+serial_type (void)
+{
+  register long __sc0 __asm__ ("r0") = 3; /* FEATURE QUERY */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0)
+		: "memory");
+
+  return (__sc0 & 0x07);
+}
+
+static int
+memory_size (void)
+{
+  register long __sc0 __asm__ ("r0") = 4; /* MEMORY SIZE */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0)
+		: "memory");
+
+  return (__sc0);
+}
+
+static int
+io_base (void)
+{
+  register long __sc0 __asm__ ("r0") = 5; /* IO BASE */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0)
+		: "memory");
+
+  return (__sc0);
+}
+
+static void
+cache_flush (void)
+{
+  register long __sc0 __asm__ ("r0") = 6; /* CACHE_CONTROL */
+  register long __sc4 __asm__ ("r4") = 0; /* ENABLE */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4)
+		: "memory");
+}
+
+static void inline
+put_string_1 (unsigned char *str, long len)
+{
+  register long __sc0 __asm__ ("r0") = 0; /* OUTPUT */
+  register long __sc4 __asm__ ("r4") = (long) str;
+  register long __sc5 __asm__ ("r5") = (long) len; /* For New BIOS */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4),  "r" (__sc5)
+		: "memory");
+}
+
+static void
+put_string (unsigned char *str)
+{
+  int len = strlen (str);
+  put_string_1 (str, len);
+}
+
+static int
+read_sectors (int dev, unsigned long lba, unsigned char *buf, int count)
+{
+  register long __sc0 __asm__ ("r0") = 2; /* READ SECTORS */
+  register long __sc4 __asm__ ("r4") = (long) dev;
+  register long __sc5 __asm__ ("r5") = (long) lba;
+  register long __sc6 __asm__ ("r6") = (long) buf;
+  register long __sc7 __asm__ ("r7") = (long) count;
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4),  "r" (__sc5),
+		  "r" (__sc6),  "r" (__sc7)
+		: "memory");
+
+  if (__sc0 < 0)
+    put_string ("ERROR: Sector read\n");
+
+  return __sc0;
+}
+
+static int
+serial_input (int timeout)
+{
+  register long __sc0 __asm__ ("r0") = 1; /* SERIAL INPUT */
+  register long __sc4 __asm__ ("r4") = (long) timeout;
+
+  if (__sc4 == 0) __sc4++;	/*** XXX ***/
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4)
+		: "memory");
+
+  return (__sc0);
+}
+
+static void
+sleep (int count)
+{
+  register long __sc0 __asm__ ("r0") = 12; /* RTC */
+  register long __sc4 __asm__ ("r4") = 4; /* SLEEP */
+  register long __sc5 __asm__ ("r5") = (long) count;
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4), "r" (__sc5)
+		: "memory");
+
+  return;
+}
+
+static void
+reset_tick (void)
+{
+  register long __sc0 __asm__ ("r0") = 12; /* RTC */
+  register long __sc4 __asm__ ("r4") = 5; /* RESET TICK */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4)
+		: "memory");
+
+  return;
+}
+
+static int
+get_tick (void)
+{
+  register long __sc0 __asm__ ("r0") = 12; /* RTC */
+  register long __sc4 __asm__ ("r4") = 6; /* GETTICK */
+
+  asm volatile ("trapa	#0x3F"
+		: "=z" (__sc0)
+		: "0" (__sc0), "r" (__sc4)
+		: "memory");
+
+  return (__sc0);
+}
+
+static void
+breakpoint (void)
+{
+  asm volatile("trapa   #0xff");
+}
+
+static int
+get_sector_address (unsigned long sector_desc, int *devp, unsigned long *lbap)
+{
+  unsigned long s;
+  unsigned char *p = (unsigned char *)(sector_desc+base_pointer);
+  int len;
+
+  /* Number of sectors */
+  len = (int)p[4];
+  if (len == 0)
+    return 0;
+
+  /* p[2]: drive number */
+  if ((int)p[2] < 0xc0)
+    /* XXX: should return error */
+    put_string ("ERROR: Sector address is not in LBA\n");
+
+  *devp = (int)p[2] & 0x0f;
+
+  s = p[0] + (p[1]<<8) + (p[3]<<16);
+
+  *lbap = s;
+
+#if 0
+  {
+    unsigned long lba = *lbap;
+
+    put_string ("DEV= ");
+    printouthex ((*devp)&0xff);
+    put_string ("\n");
+    put_string ("LBA= ");
+    printouthex ((lba>>24)&0xff);
+    printouthex ((lba>>16)&0xff);
+    printouthex ((lba>>8)&0xff);
+    printouthex (lba&0xff);
+    put_string ("\n");
+  }
+#endif
+
+  return len;
+}
+
+static int
+load_sectors (unsigned long sector_desc, unsigned long mem)
+{
+  int dev;
+  unsigned long lba;
+  int count;
+  unsigned char *buf = (unsigned char *)(mem+base_pointer);
+
+  count = get_sector_address (sector_desc, &dev, &lba);
+
+  if (count)
+    return read_sectors (dev, lba, buf, count);
+
+  return -1;
+}
+
+#if 0
+static void
+printouthex(int x)
+{
+  char z[4];
+
+  z[0] = highhex (x);
+  z[1] = lowhex (x);
+  z[2] = ' ';
+  z[3] = '\0';
+
+  put_string (z);
+}
+#endif
+
+
+
+static inline int usl5p_bootsel(unsigned long base_pointer)
+{
+  int bootsel = 0;
+  int btn;
+
+  btn = (~(BTN)) & 0x00ff;
+
+  if(btn & BTN_SEL){
+    bootsel = 3;
+  }else if(btn & BTN_RMV){
+    bootsel = 2;
+  }else if(btn & BTN_CPY){
+    bootsel = 1;
+  }
+  if (*(char *)(base_pointer + 0x3200+2+ 52*(bootsel)) == 0){
+    bootsel = 0;
+  }
+  LED = (unsigned char) (LED_PWR | (0x04 << bootsel));
+  INT_PSW = 0;
+  return bootsel;
+}
+
+static inline int Is_usl5p(void)
+{
+  unsigned char tmp1, tmp2;
+  tmp1 = LED;
+  LED = 0x40;
+  tmp2 = LED;
+  LED = tmp1;
+  return (tmp2 == 0x40) ? 1 : 0;
+}
