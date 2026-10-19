@@ -1,8 +1,8 @@
 *.o
 *.exe
 *.bin
-lilo
-boot.b
-lilo.conf
-boot.b-selk
-lilo32
+/lilo
+/boot.b
+/lilo.conf
+/boot.b-selk
+/lilo32

@@ -62,6 +62,8 @@ OBJS=lilo.o map.o geometry.o boot.o device.o common.o bsect.o cfg.o temp.o \
 
 .SUFFIXES:	.b
 
+.PHONY:		all install dep version clean precompiled
+
 all:		lilo boot.b boot.b-selk
 
 .c.o:
@@ -126,6 +128,12 @@ install:	all
 		cp boot.b boot.b-selk $$ROOT$(BOOT_DIR)
 		cp lilo $$ROOT$(SBIN_DIR)
 		$(STRIP) $$ROOT$(SBIN_DIR)/lilo
+
+precompiled:	all lilo32
+		mkdir -p precompiled
+		cp boot.b boot.b-selk precompiled/
+		$(STRIP) -o precompiled/lilo lilo
+		strip -o precompiled/lilo32 lilo32
 
 dep:
 		sed '/\#\#\# Dependencies/q' <Makefile >tmp_make

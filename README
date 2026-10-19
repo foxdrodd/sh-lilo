@@ -57,6 +57,9 @@ other files in the target disk under /mnt.
 
 Other cross compilers: make CROSS_COMPILE=sh4-unknown-linux-gnu-
 
+precompiled/ holds stripped copies of all four (make precompiled
+regenerates them), for use without the cross compiler.
+
   lilo         installer for the SH target itself, static so it runs on
                any root filesystem (also from a rescue system).
   lilo32       the same installer for a PC.  It has to be 32-bit: lilo

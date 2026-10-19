@@ -1,3 +1,8 @@
+2026-10-19  Florian Fuchs <fuchsfl@gmail.com>
+	* merge selk additions to sh-lilo
+	* update precompiled folder
+	* add install workaround using a VM to README
+
 2001-01-26  Yutaro Ebihara  <ebiharaml@si-linux.com>
 
 	* second.c (start): Add support for CAT 68701.
